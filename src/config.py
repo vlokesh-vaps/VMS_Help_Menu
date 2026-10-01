@@ -20,7 +20,7 @@ LOG_FILE = LOG_DIR / "chat.log"
 
 EMBEDDING_MODEL = "embeddinggemma:300m"
 COLLECTION_NAME = "VAPS_Group_KB"
-CHAT_MODEL = "llama-3.1-8b-instant"
+CHAT_MODEL = "meta-llama/llama-prompt-guard-2-86m"
 
 # ============================================================================
 # Retrieval Parameters
