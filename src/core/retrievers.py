@@ -1,14 +1,24 @@
-"""Document retrieval using BM25 and vector search."""
+"""Document retrieval using BM25 and vector search with LangChain BaseRetriever."""
 
 import math
 import pickle
 import time
 from collections import Counter
+from typing import Any
 
 from langchain_chroma import Chroma
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from pydantic import Field
 
-from src.config import BM25_CACHE_FILE, BM25_TOP_K, TOKEN_PATTERN, VECTOR_TOP_K
+from src.config import (
+    BM25_CACHE_FILE,
+    BM25_TOP_K,
+    FINAL_TOP_K,
+    TOKEN_PATTERN,
+    VECTOR_TOP_K,
+)
 from src.storage.vector_db import load_all_documents
 from src.utils.logging import log_step
 
@@ -93,59 +103,106 @@ class BM25Index:
         return scores[:top_k]
 
 
-class VectorRetriever:
-    """Semantic search using vector similarity."""
+class VectorRetriever(BaseRetriever):
+    """Semantic search using vector similarity as a LangChain BaseRetriever."""
 
-    def __init__(self, vector_db: Chroma, top_k: int = VECTOR_TOP_K) -> None:
-        """
-        Initialize vector retriever.
+    vector_db: Any = Field(description="Chroma vector database instance")
+    top_k: int = Field(default=VECTOR_TOP_K, description="Number of results to retrieve")
 
-        Args:
-            vector_db: Chroma vector database instance
-            top_k: Number of top results to return
-        """
-        self.vector_db = vector_db
-        self.top_k = top_k
-
-    def get_relevant_documents(self, query: str) -> list[Document]:
-        """
-        Retrieve documents similar to the query.
-
-        Args:
-            query: Search query
-
-        Returns:
-            List of relevant documents
-        """
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
+    ) -> list[Document]:
+        """Retrieve documents matching query semantically."""
         return self.vector_db.similarity_search(query, k=self.top_k)
 
-
-class BM25Retriever:
-    """Keyword-based retrieval using BM25 index."""
-
-    def __init__(self, bm25_index: BM25Index, top_k: int = BM25_TOP_K) -> None:
-        """
-        Initialize BM25 retriever.
-
-        Args:
-            bm25_index: BM25Index instance
-            top_k: Number of top results to return
-        """
-        self.bm25_index = bm25_index
-        self.top_k = top_k
-
     def get_relevant_documents(self, query: str) -> list[Document]:
-        """
-        Retrieve documents matching the query.
+        """Backward-compatible retrieval method."""
+        return self._get_relevant_documents(query)
 
-        Args:
-            query: Search query
 
-        Returns:
-            List of relevant documents
-        """
+class BM25Retriever(BaseRetriever):
+    """Keyword-based retrieval using BM25 index as a LangChain BaseRetriever."""
+
+    bm25_index: Any = Field(description="BM25Index instance")
+    top_k: int = Field(default=BM25_TOP_K, description="Number of results to retrieve")
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
+    ) -> list[Document]:
+        """Retrieve documents matching query keywords."""
         results = self.bm25_index.search(query, top_k=self.top_k)
         return [doc for _, doc in results]
+
+    def get_relevant_documents(self, query: str) -> list[Document]:
+        """Backward-compatible retrieval method."""
+        return self._get_relevant_documents(query)
+
+
+def _doc_key(doc: Document) -> tuple[object, str]:
+    """Generate a unique key for a document based on page and content snippet."""
+    return doc.metadata.get("page"), doc.page_content[:160]
+
+
+class EnsembleRetriever(BaseRetriever):
+    """
+    Hybrid retriever combining Vector and BM25 retrievers via Reciprocal Rank Fusion.
+    """
+
+    vector_retriever: VectorRetriever = Field(description="Vector search retriever")
+    bm25_retriever: BM25Retriever = Field(description="BM25 search retriever")
+    final_top_k: int = Field(default=FINAL_TOP_K, description="Max documents to return")
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
+    ) -> list[Document]:
+        """Execute hybrid search using Reciprocal Rank Fusion."""
+        v_start = time.perf_counter()
+        vector_docs = self.vector_retriever.invoke(query)
+        v_latency = int((time.perf_counter() - v_start) * 1000)
+        log_step("VECTOR_SEARCH", latency=f"{v_latency}ms", hits=len(vector_docs))
+
+        b_start = time.perf_counter()
+        bm25_docs = self.bm25_retriever.invoke(query)
+        b_latency = int((time.perf_counter() - b_start) * 1000)
+        log_step("BM25_SEARCH", latency=f"{b_latency}ms", hits=len(bm25_docs))
+
+        # Reciprocal Rank Fusion (RRF)
+        fused_scores: dict[tuple[object, str], float] = {}
+        docs_by_key: dict[tuple[object, str], Document] = {}
+
+        for rank, doc in enumerate(vector_docs, start=1):
+            key = _doc_key(doc)
+            fused_scores[key] = fused_scores.get(key, 0.0) + (1.0 / (60.0 + rank))
+            docs_by_key[key] = doc
+
+        for rank, doc in enumerate(bm25_docs, start=1):
+            key = _doc_key(doc)
+            fused_scores[key] = fused_scores.get(key, 0.0) + (1.0 / (60.0 + rank))
+            docs_by_key[key] = doc
+
+        ranked_keys = sorted(fused_scores, key=fused_scores.get, reverse=True)
+        merged_docs = [docs_by_key[key] for key in ranked_keys[: self.final_top_k]]
+
+        total_latency = v_latency + b_latency
+        log_step("SEARCH_DONE", latency=f"{total_latency}ms", hits=len(merged_docs))
+        return merged_docs
+
+
+def create_ensemble_retriever(
+    vector_db: Chroma,
+    bm25_index: BM25Index,
+    vector_top_k: int = VECTOR_TOP_K,
+    bm25_top_k: int = BM25_TOP_K,
+    final_top_k: int = FINAL_TOP_K,
+) -> EnsembleRetriever:
+    """Factory function to build a unified EnsembleRetriever."""
+    v_retriever = VectorRetriever(vector_db=vector_db, top_k=vector_top_k)
+    b_retriever = BM25Retriever(bm25_index=bm25_index, top_k=bm25_top_k)
+    return EnsembleRetriever(
+        vector_retriever=v_retriever,
+        bm25_retriever=b_retriever,
+        final_top_k=final_top_k,
+    )
 
 
 def _bm25_cache_is_current() -> bool:
@@ -189,4 +246,3 @@ def load_bm25_index(vector_db: Chroma) -> BM25Index:
     with BM25_CACHE_FILE.open("wb") as file:
         pickle.dump(bm25_index, file)
     return bm25_index
-

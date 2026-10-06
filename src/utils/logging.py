@@ -1,28 +1,42 @@
-"""Logging utilities for VAPSAI chatbot."""
+"""Logging utilities for VMS_Help_Menu chatbot."""
 
-import importlib.util
 import json
-import sysconfig
+import logging as std_logging
+from logging.handlers import RotatingFileHandler
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 from src.config import LOG_DIR, LOG_FILE
 
-# Load the standard library logging module
-_STDLIB_LOGGING_PATH = Path(sysconfig.get_path("stdlib")) / "logging" / "__init__.py"
-_SPEC = importlib.util.spec_from_file_location("_stdlib_logging", _STDLIB_LOGGING_PATH)
-if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load standard logging module from {_STDLIB_LOGGING_PATH}")
+# Ensure log directory exists
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-_STDLIB_LOGGING = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_STDLIB_LOGGING)
+# Configure internal logger
+_logger = std_logging.getLogger("vaps_help_menu")
+_logger.setLevel(std_logging.INFO)
+_logger.propagate = False
 
-# Re-export standard logging module
-for _name in dir(_STDLIB_LOGGING):
-    if _name.startswith("__") and _name not in {"__all__", "__doc__"}:
-        continue
-    globals()[_name] = getattr(_STDLIB_LOGGING, _name)
+if not _logger.handlers:
+    # Rotating file handler (10MB per file, max 5 backups)
+    _file_handler = RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _file_handler.setLevel(std_logging.INFO)
+    _file_format = std_logging.Formatter("%(message)s")
+    _file_handler.setFormatter(_file_format)
+    _logger.addHandler(_file_handler)
+
+    # Console stream handler for container/Docker stdout
+    _console_handler = std_logging.StreamHandler(sys.stdout)
+    _console_handler.setLevel(std_logging.INFO)
+    _console_format = std_logging.Formatter("%(message)s")
+    _console_handler.setFormatter(_console_format)
+    _logger.addHandler(_console_handler)
 
 
 def _format_value(value: object) -> str:
@@ -36,20 +50,19 @@ def log_step(step_name: str, **values: object) -> None:
     """
     Log a processing step with optional key-value pairs.
 
+    Writes to both rotating log file and stdout.
+
     Args:
         step_name: Name of the processing step
         **values: Additional key-value pairs to log
     """
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
     timestamp = datetime.now().strftime("%H:%M:%S")
     details = " ".join(f"{key}={_format_value(value)}" for key, value in values.items())
     line = f"[{timestamp}] {step_name}"
     if details:
         line = f"{line} {details}"
 
-    with LOG_FILE.open("a", encoding="utf-8") as file:
-        file.write(f"{line}\n")
+    _logger.info(line)
 
 
 def log_error(step_name: str, error: Exception, **values: object) -> None:
@@ -66,4 +79,3 @@ def log_error(step_name: str, error: Exception, **values: object) -> None:
     payload["error"] = str(error)
     payload["traceback"] = traceback.format_exc(limit=10)
     log_step(step_name, **payload)
-

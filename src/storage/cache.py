@@ -1,10 +1,10 @@
-"""Cache management for chatbot responses."""
-
 import json
 import math
+import os
+import tempfile
 import time
-from pathlib import Path
 from hashlib import sha256
+from pathlib import Path
 
 from langchain_ollama import OllamaEmbeddings
 
@@ -13,6 +13,7 @@ from src.config import (
     CACHE_VERSION,
     EMBEDDING_MODEL,
     MAX_CACHE_ENTRIES,
+    OLLAMA_BASE_URL,
     SEMANTIC_CACHE_THRESHOLD,
     normalize_question,
 )
@@ -26,13 +27,8 @@ def get_semantic_embedder() -> OllamaEmbeddings:
     """Get or create the semantic embedder singleton."""
     global _semantic_embedder
     if _semantic_embedder is None:
-        _semantic_embedder = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        _semantic_embedder = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
     return _semantic_embedder
-
-
-def normalize_question(question: str) -> str:
-    """Normalize a question by lowercasing and collapsing whitespace."""
-    return " ".join(question.lower().split())
 
 
 def make_cache_key(question: str) -> str:
@@ -85,9 +81,10 @@ def load_cache() -> dict[str, dict[str, object]]:
 
 def save_cache(cache: dict[str, dict[str, object]]) -> None:
     """
-    Save the cache to disk.
+    Save the cache to disk atomically.
 
     Removes oldest entries if cache exceeds MAX_CACHE_ENTRIES.
+    Uses atomic file replacement to prevent corruption under concurrency.
     """
     if len(cache) > MAX_CACHE_ENTRIES:
         ordered_items = sorted(
@@ -98,8 +95,25 @@ def save_cache(cache: dict[str, dict[str, object]]) -> None:
         cache = dict(ordered_items[:MAX_CACHE_ENTRIES])
 
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with CACHE_FILE.open("w", encoding="utf-8") as file:
-        json.dump(cache, file, indent=2, ensure_ascii=True)
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=str(CACHE_FILE.parent),
+            delete=False,
+            encoding="utf-8",
+            suffix=".tmp",
+        ) as file:
+            temp_file = file.name
+            json.dump(cache, file, indent=2, ensure_ascii=True)
+        os.replace(temp_file, CACHE_FILE)
+    except Exception as exc:
+        log_error("CACHE_SAVE_FAILED", exc)
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
 
 
 def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:

@@ -4,7 +4,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 
-from src.config import COLLECTION_NAME, EMBEDDING_MODEL, PERSIST_DIRECTORY
+from src.config import COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BASE_URL, PERSIST_DIRECTORY
 from src.utils.logging import log_error
 
 
@@ -23,7 +23,7 @@ def load_vector_store() -> Chroma:
             f"Vector DB not found at {PERSIST_DIRECTORY}. Run scripts/build_kb.py first."
         )
 
-    embedding_model = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    embedding_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
     embedding_model.embed_query("warmup")
     return Chroma(
         collection_name=COLLECTION_NAME,

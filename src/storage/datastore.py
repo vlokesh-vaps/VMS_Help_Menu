@@ -8,10 +8,11 @@ from src.config import (
     DATASTORE_TIMEOUT,
     DATASTORE_URL,
     DATASTORE_USER_AGENT,
+    DATASTORE_VERIFY_SSL,
     DATASTORE_WEBSITE_NAME,
     DATASTORE_WEBSITE_URL,
 )
-from src.utils.logging import log_step
+from src.utils.logging import log_error, log_step
 
 
 SESSION_WEBSITE_MAP = {
@@ -40,7 +41,7 @@ def save_conversation(session_id: str, user_message: str, ai_reply: str) -> None
         user_message: User's message
         ai_reply: AI response
     """
-    # Construct the JSON string for ConversationDetails as requested
+    # Construct the JSON string for ConversationDetails
     conversation_details = json.dumps({
         "User Message": user_message,
         "AI Reply": ai_reply
@@ -67,17 +68,18 @@ def save_conversation(session_id: str, user_message: str, ai_reply: str) -> None
         }
     )
 
-    # Ignore SSL verification if staging cert is invalid
-    context = ssl._create_unverified_context()
+    # SSL context based on configuration
+    context = (
+        ssl.create_default_context()
+        if DATASTORE_VERIFY_SSL
+        else ssl._create_unverified_context()
+    )
 
     try:
         with urllib.request.urlopen(req, context=context, timeout=DATASTORE_TIMEOUT) as response:
             status_code = response.getcode()
-            response_body = response.read().decode("utf-8")
-
-            log_step("DATASTORE_SUCCESS", status=status_code, session_id=session_id)
-            print(f"Datastore save success: {status_code} - {response_body}")
-    except Exception as e:
-        log_step("DATASTORE_ERROR", error=str(e), session_id=session_id)
-        print(f"Datastore save failed: {e}")
+            response_body = response.read().decode("utf-8", errors="replace")
+            log_step("DATASTORE_SUCCESS", status=status_code, session_id=session_id, response=response_body[:200])
+    except Exception as exc:
+        log_error("DATASTORE_ERROR", exc, session_id=session_id)
 

@@ -217,7 +217,7 @@ GROQ_API_KEY=your_groq_api_key_here
 
 ### Application Configuration (`src/config.py`)
 **Embedding & LLM:**
-- `EMBEDDING_MODEL`: Ollama embedding model (default: `embeddinggemma:300m`)
+- `EMBEDDING_MODEL`: Ollama embedding model (default: `embeddinggemma:latest`)
 - `CHAT_MODEL`: LLM model (default: `llama-3.1-8b-instant`)
 - `LLM_TEMPERATURE`: Creativity level (default: 0.3 for API, 0.7 for CLI)
 - `LLM_MAX_TOKENS`: Max response length (default: 160)
@@ -240,11 +240,9 @@ GROQ_API_KEY=your_groq_api_key_here
 
 ## Setup Instructions
 
-## Setup Instructions
-
 ### 1. Prerequisites
 - Python 3.10 or higher
-- Ollama (running with `embeddinggemma:300m` model)
+- Ollama (running with `embeddinggemma:latest` model)
 - Groq API key (get from https://console.groq.com)
 
 ### 2. Install Dependencies
@@ -358,7 +356,7 @@ curl -X POST http://localhost:5008/webhook/chat \
 ## Requirements
 
 - Python 3.10+
-- Ollama (with `embeddinggemma:300m` model)
+- Ollama (with `embeddinggemma:latest` model)
 - Groq API key
 - See `requirements.txt` for Python dependencies
 

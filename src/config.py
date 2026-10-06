@@ -1,5 +1,6 @@
 """Configuration and constants for VAPSAI chatbot."""
 
+import os
 import re
 from pathlib import Path
 
@@ -18,27 +19,28 @@ LOG_FILE = LOG_DIR / "chat.log"
 # Model and Embedding Configuration
 # ============================================================================
 
-EMBEDDING_MODEL = "embeddinggemma:300m"
+EMBEDDING_MODEL = "embeddinggemma:latest"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
 COLLECTION_NAME = "VAPS_Group_KB"
-CHAT_MODEL = "meta-llama/llama-prompt-guard-2-86m"
-
+CHAT_MODEL = "openai/gpt-oss-20b"
 # ============================================================================
 # Retrieval Parameters
 # ============================================================================
 
-VECTOR_TOP_K = 2
-BM25_TOP_K = 2
-FINAL_TOP_K = 3
-MAX_CONTEXT_CHARS = 1800
+VECTOR_TOP_K = 4
+BM25_TOP_K = 4
+FINAL_TOP_K = 6
+MAX_CONTEXT_CHARS = 3500
 
 # ============================================================================
 # Chat and Cache Configuration
 # ============================================================================
 
 MAX_HISTORY_MESSAGES = 6
+MAX_SESSION_ENTRIES = 1000
 CACHE_VERSION = 2
 MAX_CACHE_ENTRIES = 200
-SEMANTIC_CACHE_THRESHOLD = 0.90
+SEMANTIC_CACHE_THRESHOLD = 0.82
 
 # ============================================================================
 # Regex Patterns
@@ -79,18 +81,20 @@ API_TITLE = "AI Chatbot API"
 # ============================================================================
 
 LLM_TEMPERATURE = 0.3
-LLM_MAX_TOKENS = 160
+LLM_MAX_TOKENS = 1024
 LLM_TEMPERATURE_CHAT = 0.7
 
 # ============================================================================
 # External Datastore Configuration
 # ============================================================================
 
+ENABLE_DATASTORE_LOGGING = os.getenv("ENABLE_DATASTORE_LOGGING", "false").lower() == "true"
 DATASTORE_URL = "https://vmsstaging.vapssmartecampus.com:40015/api/ISMDashboardFacade/Save_AI_ChatBot_Conversation/"
 DATASTORE_TIMEOUT = 10
 DATASTORE_WEBSITE_NAME = "Vaps"
 DATASTORE_WEBSITE_URL = "https://vapstech.com/"
 DATASTORE_USER_AGENT = "VAPSChatbot/1.0"
+DATASTORE_VERIFY_SSL = os.getenv("DATASTORE_VERIFY_SSL", "false").lower() == "true"
 
 # ============================================================================
 # PDF Configuration
@@ -99,6 +103,3 @@ DATASTORE_USER_AGENT = "VAPSChatbot/1.0"
 PDF_PATH = BASE_DIR / "KB_PDF/VMS_IssueManager_Chatbot_KnowledgeBase.pdf"
 PDF_CHUNK_SIZE = 500
 PDF_CHUNK_OVERLAP = 80
-
-# Contact information (update with real VAPS contact number)
-VAPS_CONTACT_NUMBER = "08068112975"

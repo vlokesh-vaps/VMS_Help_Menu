@@ -78,7 +78,7 @@ services:
         until ollama list >/dev/null 2>&1; do
           sleep 2
         done
-        ollama pull embeddinggemma:300m
+        ollama pull embeddinggemma:latest
 
 volumes:
   vapshelp-ollama-data:

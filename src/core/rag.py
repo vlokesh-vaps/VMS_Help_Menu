@@ -1,31 +1,40 @@
-"""Core RAG (Retrieval Augmented Generation) pipeline."""
+"""Core RAG (Retrieval Augmented Generation) pipeline built using LangChain methods."""
 
 import os
 import time
+from typing import Any
 
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel
 from langchain_groq import ChatGroq
 
 from src.config import (
     CHAT_MODEL,
     FINAL_TOP_K,
     LLM_MAX_TOKENS,
-    LLM_TEMPERATURE,
     LLM_TEMPERATURE_CHAT,
     MAX_CONTEXT_CHARS,
     MAX_HISTORY_MESSAGES,
 )
 from src.core.prompts import (
-    build_direct_context_prompt,
-    build_prompt,
+    DIRECT_CONTEXT_PROMPT,
+    QA_PROMPT,
     classify_query,
-    format_history,
+    to_langchain_messages,
 )
-from src.core.retrievers import BM25Index, BM25Retriever, VectorRetriever, load_bm25_index
+from src.core.retrievers import (
+    BM25Index,
+    BM25Retriever,
+    EnsembleRetriever,
+    VectorRetriever,
+    create_ensemble_retriever,
+    load_bm25_index,
+)
 from src.storage.cache import get_cached_answer, update_cache
 from src.storage.vector_db import load_vector_store
 from src.utils.logging import log_error, log_step
-
 
 LOW_CONFIDENCE_CACHE_PATTERNS = (
     "sorry, i missed something",
@@ -38,27 +47,87 @@ LOW_CONFIDENCE_CACHE_PATTERNS = (
     "not available in the context",
 )
 
+
 def _is_low_confidence_cached_answer(answer: str) -> bool:
     """Return True for cached fallback answers that should not block retrieval."""
     normalized_answer = " ".join(answer.lower().split())
     return any(pattern in normalized_answer for pattern in LOW_CONFIDENCE_CACHE_PATTERNS)
 
 
+def format_context_docs(docs: list[Document]) -> str:
+    """
+    Format retrieved LangChain documents into bounded context string.
 
-def doc_key(doc) -> tuple[object, str]:
-    """Generate a unique key for a document based on page and content."""
-    return doc.metadata.get("page"), doc.page_content[:160]
+    Args:
+        docs: List of retrieved Document objects
+
+    Returns:
+        Formatted context string bounded by MAX_CONTEXT_CHARS
+    """
+    context_parts: list[str] = []
+    current_length = 0
+    for doc in docs:
+        page = doc.metadata.get("page", "unknown")
+        part = f"[Page {page}]\n{doc.page_content}"
+        if current_length + len(part) > MAX_CONTEXT_CHARS:
+            break
+        context_parts.append(part)
+        current_length += len(part)
+
+    log_step("CONTEXT_READY", chars=current_length, docs=len(context_parts))
+    return "\n\n".join(context_parts)
+
+
+def build_rag_chain(llm: ChatGroq):
+    """
+    Construct LCEL RAG chain for question answering with context and history.
+
+    Args:
+        llm: Language model runnable
+
+    Returns:
+        LCEL chain: (input dict -> QA_PROMPT -> llm -> StrOutputParser)
+    """
+    return (
+        RunnableParallel({
+            "context": lambda x: format_context_docs(x.get("docs", [])),
+            "question": lambda x: x["question"],
+            "chat_history": lambda x: x.get("chat_history", []),
+        })
+        | QA_PROMPT
+        | llm
+        | StrOutputParser()
+    )
+
+
+def build_direct_chain(llm: ChatGroq):
+    """
+    Construct LCEL chain for direct-context queries.
+
+    Args:
+        llm: Language model runnable
+
+    Returns:
+        LCEL chain: (input dict -> DIRECT_CONTEXT_PROMPT -> llm -> StrOutputParser)
+    """
+    return (
+        RunnableParallel({
+            "question": lambda x: x["question"],
+            "chat_history": lambda x: x.get("chat_history", []),
+        })
+        | DIRECT_CONTEXT_PROMPT
+        | llm
+        | StrOutputParser()
+    )
 
 
 def hybrid_search(
     vector_retriever: VectorRetriever,
     bm25_retriever: BM25Retriever,
     question: str,
-) -> list:
+) -> list[Document]:
     """
-    Perform hybrid search combining vector and BM25 results.
-
-    Uses reciprocal rank fusion to combine results from multiple retrievers.
+    Backward-compatible hybrid search using EnsembleRetriever.
 
     Args:
         vector_retriever: Vector search retriever
@@ -68,36 +137,12 @@ def hybrid_search(
     Returns:
         List of top-k merged documents
     """
-    vector_start = time.perf_counter()
-    vector_docs = vector_retriever.get_relevant_documents(question)
-    vector_latency_ms = int((time.perf_counter() - vector_start) * 1000)
-    log_step("VECTOR_SEARCH", latency=f"{vector_latency_ms}ms", hits=len(vector_docs))
-
-    bm25_start = time.perf_counter()
-    bm25_docs = bm25_retriever.get_relevant_documents(question)
-    bm25_latency_ms = int((time.perf_counter() - bm25_start) * 1000)
-    log_step("BM25_SEARCH", latency=f"{bm25_latency_ms}ms", hits=len(bm25_docs))
-
-    # Reciprocal rank fusion
-    fused_scores: dict[tuple[object, str], float] = {}
-    docs_by_key: dict[tuple[object, str], object] = {}
-
-    for rank, doc in enumerate(vector_docs, start=1):
-        key = doc_key(doc)
-        fused_scores[key] = fused_scores.get(key, 0.0) + (1 / (60 + rank))
-        docs_by_key[key] = doc
-
-    for rank, doc in enumerate(bm25_docs, start=1):
-        key = doc_key(doc)
-        fused_scores[key] = fused_scores.get(key, 0.0) + (1 / (60 + rank))
-        docs_by_key[key] = doc
-
-    ranked_keys = sorted(fused_scores, key=fused_scores.get, reverse=True)
-    merged_docs = [docs_by_key[key] for key in ranked_keys[:FINAL_TOP_K]]
-
-    total_latency_ms = vector_latency_ms + bm25_latency_ms
-    log_step("SEARCH_DONE", latency=f"{total_latency_ms}ms", hits=len(merged_docs))
-    return merged_docs
+    ensemble = EnsembleRetriever(
+        vector_retriever=vector_retriever,
+        bm25_retriever=bm25_retriever,
+        final_top_k=FINAL_TOP_K,
+    )
+    return ensemble.invoke(question)
 
 
 def answer_question(
@@ -107,16 +152,17 @@ def answer_question(
     cache: dict[str, dict[str, object]],
     chat_history: list[dict[str, str]],
     question: str,
+    ensemble_retriever: EnsembleRetriever | None = None,
 ) -> str:
     """
-    Answer a user question using RAG pipeline.
+    Answer a user question using the LangChain RAG pipeline.
 
-    Implements multi-route logic:
-    1. Check cache (exact and semantic)
-    2. Handle small talk
-    3. Handle direct context requests
-    4. Perform hybrid retrieval
-    5. Generate answer with LLM
+    Multi-route execution:
+    1. Check exact and semantic response cache
+    2. Handle small talk directly
+    3. Handle direct-context requests using LCEL direct chain
+    4. Perform hybrid retrieval via LangChain EnsembleRetriever
+    5. Generate structured answer with LCEL RAG chain
 
     Args:
         vector_db: Chroma vector database
@@ -125,15 +171,15 @@ def answer_question(
         cache: Response cache
         chat_history: Conversation history
         question: User question
+        ensemble_retriever: Optional pre-initialized EnsembleRetriever
 
     Returns:
-        AI response
+        Grounded AI response
     """
     route = classify_query(question)
     log_step("ROUTE_DECISION", route=route)
 
-
-    # Try cache first
+    # 1. Check cache first
     cached_answer = get_cached_answer(cache, question)
     if cached_answer and not (
         route == "retrieval" and _is_low_confidence_cached_answer(cached_answer)
@@ -150,9 +196,9 @@ def answer_question(
     else:
         log_step("CACHE_MISS", route=route)
 
-    # Handle small talk
+    # 2. Handle small talk
     if route == "small_talk":
-        answer = "Hello! How can I assist you today?"
+        answer = "Hello! How can I assist you today with the VMS IssueManager platform?"
         update_cache(cache, question, answer, route)
         log_step("VECTOR_SEARCH", latency="0ms", hits=0, source="route")
         log_step("BM25_SEARCH", latency="0ms", hits=0, source="route")
@@ -160,15 +206,20 @@ def answer_question(
         log_step("LLM_RESPONSE", latency="0ms", source="route")
         return answer
 
-    history = format_history(chat_history)
+    # Convert conversation history to LangChain BaseMessage objects
+    lc_messages = to_langchain_messages(chat_history)
 
-    # Handle direct context requests
+    # 3. Handle direct context requests
     if route == "direct_context":
-        prompt = build_direct_context_prompt(question, history)
+        direct_chain = build_direct_chain(llm)
         llm_start = time.perf_counter()
-        response = llm.invoke(prompt)
-        answer = response.content.strip()
+        raw_answer = direct_chain.invoke({
+            "question": question,
+            "chat_history": lc_messages,
+        })
+        answer = raw_answer.strip() if isinstance(raw_answer, str) else str(raw_answer).strip()
         llm_latency_ms = int((time.perf_counter() - llm_start) * 1000)
+
         log_step("VECTOR_SEARCH", latency="0ms", hits=0, source="bypass")
         log_step("BM25_SEARCH", latency="0ms", hits=0, source="bypass")
         log_step("SEARCH_DONE", latency="0ms", hits=0, source="bypass")
@@ -176,38 +227,42 @@ def answer_question(
         update_cache(cache, question, answer, route)
         return answer
 
-    # Perform retrieval
-    vector_retriever = VectorRetriever(vector_db)
-    bm25_retriever = BM25Retriever(bm25_index)
-    docs = hybrid_search(vector_retriever, bm25_retriever, question)
+    # 4. Perform hybrid retrieval using EnsembleRetriever
+    retriever = ensemble_retriever or create_ensemble_retriever(vector_db, bm25_index)
+    docs = retriever.invoke(question)
+
     if not docs:
-        return "I could not find anything relevant in the knowledge base."
+        log_step("SEARCH_EMPTY", route=route)
+        return (
+            "I don't have information about that in the VMS knowledge base. "
+            "Please provide more details or rephrase your question."
+        )
 
-    # Build context
-    context_parts = []
-    current_length = 0
-    for doc in docs:
-        part = f"[Page {doc.metadata.get('page', 'unknown')}]\n{doc.page_content}"
-        if current_length + len(part) > MAX_CONTEXT_CHARS:
-            break
-        context_parts.append(part)
-        current_length += len(part)
-
-    context = "\n\n".join(context_parts)
-    prompt = build_prompt(question, context, history)
-    log_step("CONTEXT_READY", chars=len(context), docs=len(context_parts))
-
-    # Generate answer
+    # 5. Generate answer using LCEL RAG chain
+    rag_chain = build_rag_chain(llm)
     llm_start = time.perf_counter()
-    response = llm.invoke(prompt)
-    answer = response.content.strip()
+    raw_answer = rag_chain.invoke({
+        "docs": docs,
+        "question": question,
+        "chat_history": lc_messages,
+    })
+    answer = raw_answer.strip() if isinstance(raw_answer, str) else str(raw_answer).strip()
     llm_latency_ms = int((time.perf_counter() - llm_start) * 1000)
     log_step("LLM_RESPONSE", latency=f"{llm_latency_ms}ms")
+
+    # Guard: Never return an empty string to the user
+    if not answer:
+        log_step("LLM_EMPTY_RESPONSE", route=route)
+        answer = (
+            "I'm sorry, I was unable to generate a response. "
+            "Please try rephrasing your question or provide more details."
+        )
 
     if _is_low_confidence_cached_answer(answer):
         log_step("CACHE_SKIP", route=route, reason="low_confidence_answer")
     else:
         update_cache(cache, question, answer, route)
+
     return answer
 
 
@@ -223,6 +278,7 @@ def chat() -> None:
 
     vector_db = load_vector_store()
     bm25_index = load_bm25_index(vector_db)
+    ensemble = create_ensemble_retriever(vector_db, bm25_index)
 
     llm = ChatGroq(
         groq_api_key=os.getenv("GROQ_API_KEY"),
@@ -232,6 +288,7 @@ def chat() -> None:
     )
 
     from src.storage.cache import load_cache
+
     cache = load_cache()
     chat_history: list[dict[str, str]] = []
 
@@ -250,7 +307,15 @@ def chat() -> None:
             log_step("QUERY_START", query=question)
             log_step("USER_MESSAGE", text=question)
 
-            answer = answer_question(vector_db, bm25_index, llm, cache, chat_history, question)
+            answer = answer_question(
+                vector_db=vector_db,
+                bm25_index=bm25_index,
+                llm=llm,
+                cache=cache,
+                chat_history=chat_history,
+                question=question,
+                ensemble_retriever=ensemble,
+            )
             chat_history.append({"role": "user", "content": question})
             chat_history.append({"role": "assistant", "content": answer})
 
@@ -265,4 +330,3 @@ def chat() -> None:
         except Exception as exc:
             log_error("CHAT_LOOP_ERROR", exc, question=question)
             print(f"Bot: Request failed: {exc}")
-
