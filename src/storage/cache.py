@@ -178,7 +178,15 @@ def get_cached_answer(
             best_score = score
             best_answer = answer
 
-    if best_answer and best_score >= SEMANTIC_CACHE_THRESHOLD:
+    threshold = SEMANTIC_CACHE_THRESHOLD
+    try:
+        from src.admin.config_service import load_config
+
+        threshold = load_config().performance.semantic_cache_threshold
+    except (OSError, ValueError):
+        pass
+
+    if best_answer and best_score >= threshold:
         log_step("SEMANTIC_CACHE_HIT", similarity=round(best_score, 4))
         return best_answer
 

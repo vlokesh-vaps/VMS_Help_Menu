@@ -11,9 +11,42 @@ from langchain_core.prompts import (
 from src.config import (
     DIRECT_CONTENT_HINTS,
     GREETING_PATTERN,
+    MAX_HISTORY_CHARS,
+    MAX_HISTORY_MESSAGE_CHARS,
     MAX_HISTORY_MESSAGES,
+    TIME_QUERY_PATTERN,
     normalize_question,
 )
+
+
+def _bounded_history(chat_history: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Keep the newest history within the configured prompt-size budget."""
+    if not chat_history:
+        return []
+
+    max_messages = MAX_HISTORY_MESSAGES
+    max_history_chars = MAX_HISTORY_CHARS
+    try:
+        from src.admin.config_service import load_config
+
+        performance = load_config().performance
+        max_messages = performance.max_history_messages
+        max_history_chars = performance.max_history_chars
+    except (OSError, ValueError):
+        pass
+
+    bounded: list[dict[str, str]] = []
+    used_chars = 0
+    for item in reversed(chat_history[-max_messages:]):
+        content = str(item.get("content", ""))[:MAX_HISTORY_MESSAGE_CHARS]
+        message = {"role": str(item.get("role", "")), "content": content}
+        message_chars = len(content)
+        if bounded and used_chars + message_chars > max_history_chars:
+            break
+        bounded.append(message)
+        used_chars += message_chars
+    bounded.reverse()
+    return bounded
 
 
 def to_langchain_messages(chat_history: list[dict[str, str]] | None) -> list[BaseMessage]:
@@ -30,7 +63,7 @@ def to_langchain_messages(chat_history: list[dict[str, str]] | None) -> list[Bas
         return []
 
     messages: list[BaseMessage] = []
-    for item in chat_history[-MAX_HISTORY_MESSAGES:]:
+    for item in _bounded_history(chat_history):
         role = item.get("role", "").lower()
         content = item.get("content", "")
         if role in ("user", "human"):
@@ -54,7 +87,7 @@ def format_history(chat_history: list[dict[str, str]]) -> str:
         return "No prior conversation."
 
     lines = []
-    for message in chat_history[-MAX_HISTORY_MESSAGES:]:
+    for message in _bounded_history(chat_history):
         role = message.get("role", "User").capitalize()
         lines.append(f"{role}: {message.get('content', '')}")
     return "\n".join(lines)
@@ -62,8 +95,9 @@ def format_history(chat_history: list[dict[str, str]]) -> str:
 
 def classify_query(question: str) -> str:
     """
-    Classify a query into one of three categories:
+    Classify a query into one of four categories:
     - small_talk: Greeting or casual message
+    - tool_call: Request for live information supplied by a tool
     - direct_context: User provides content or asks for structured output
     - retrieval: Standard question requiring knowledge base lookup
 
@@ -74,6 +108,8 @@ def classify_query(question: str) -> str:
         Query classification string
     """
     normalized_question = normalize_question(question)
+    if TIME_QUERY_PATTERN.search(normalized_question):
+        return "tool_call"
     if GREETING_PATTERN.match(normalized_question):
         return "small_talk"
     if any(hint in normalized_question for hint in DIRECT_CONTENT_HINTS):
@@ -125,6 +161,60 @@ DIRECT_CONTEXT_PROMPT = ChatPromptTemplate.from_messages(
         HumanMessagePromptTemplate.from_template("User request:\n{question}\n\nAnswer:"),
     ]
 )
+
+
+def _active_prompt_config() -> dict[str, str]:
+    """Load editable prompt text while preserving source-code defaults."""
+    try:
+        from src.admin.config_service import load_config
+
+        return load_config().prompts.model_dump()
+    except (OSError, ValueError):
+        return {
+            "system_prompt": SYSTEM_RAG_INSTRUCTIONS,
+            "rag_prompt": "Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:",
+            "context_instructions": SYSTEM_DIRECT_INSTRUCTIONS,
+        }
+
+
+def build_active_qa_prompt() -> ChatPromptTemplate:
+    """Build the RAG prompt from the validated admin configuration."""
+    values = _active_prompt_config()
+    return ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(values["system_prompt"]),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            HumanMessagePromptTemplate.from_template(values["rag_prompt"]),
+        ]
+    )
+
+
+def build_active_direct_prompt() -> ChatPromptTemplate:
+    """Build the direct-context prompt from the validated admin configuration."""
+    values = _active_prompt_config()
+    return ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(values["context_instructions"]),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            HumanMessagePromptTemplate.from_template("User request:\n{question}\n\nAnswer:"),
+        ]
+    )
+
+
+def active_response_text(name: str, fallback: str) -> str:
+    """Return a configured response string such as greeting or no-answer text."""
+    values = _active_prompt_config()
+    return values.get(name, fallback)
+
+
+def active_guardrail_text(fallback: str) -> str:
+    """Return the configured pure-RAG out-of-scope response."""
+    try:
+        from src.admin.config_service import load_config
+
+        return load_config().guardrails.out_of_scope_response
+    except (OSError, ValueError):
+        return fallback
 
 
 def build_prompt(question: str, context: str, history: str) -> str:

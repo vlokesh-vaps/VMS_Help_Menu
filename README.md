@@ -7,8 +7,9 @@ This is a **pure Retrieval Augmented Generation (RAG) chatbot** designed to answ
 **Core Features:**
 - ✅ **Pure RAG**: No lead capture, no sales funnel - focused entirely on question answering
 - ✅ **Hybrid Search**: Combines vector search (semantic) + BM25 (keyword) for better recall
-- ✅ **Intelligent Routing**: Automatically routes queries to cache, small talk handler, or RAG pipeline
-- ✅ **Multi-turn Chat**: Maintains conversation history across sessions
+- ✅ **Intelligent Routing**: Routes live-time tool requests, cache, small talk, direct context, or hybrid RAG
+- ✅ **Multi-turn Chat**: Maintains bounded conversation history across sessions
+- ✅ **AI Control Center**: Internal Bootstrap/vanilla-JS UI for validated runtime configuration and health checks
 - ✅ **Smart Caching**: Exact and semantic cache lookup for instant responses
 - ✅ **REST API**: FastAPI endpoint for easy integration
 - ✅ **Docker Ready**: Complete Docker Compose setup with Ollama support
@@ -24,10 +25,17 @@ VMS_Help_Menu/
 │   │   ├── __init__.py
 │   │   ├── rag.py                      # Main RAG pipeline and chat loop
 │   │   ├── retrievers.py               # BM25Index, VectorRetriever, BM25Retriever
-│   │   └── prompts.py                  # Prompt construction functions
+│   │   ├── prompts.py                  # Prompt construction functions
+│   │   └── tools.py                    # Deterministic live-information tools
+│   ├── admin/                           # Control Center configuration and health services
+│   │   ├── config_service.py            # Validated atomic JSON configuration persistence
+│   │   ├── health_service.py            # Real dependency health checks
+│   │   ├── provider_service.py          # Backend provider/model catalog
+│   │   └── schemas.py                   # Pydantic admin contracts
 │   ├── api/                            # REST API layer
 │   │   ├── __init__.py
 │   │   ├── app.py                      # FastAPI application
+│   │   ├── admin.py                    # Control Center API routes
 │   │   └── schemas.py                  # Pydantic request/response models
 │   ├── storage/                        # Data persistence layer
 │   │   ├── __init__.py
@@ -47,6 +55,11 @@ VMS_Help_Menu/
 │   │   └── chat_cache.json
 │   └── logs/                           # Application logs
 │       └── chat.log
+│   └── admin_config.json                # Runtime Control Center configuration
+├── static/                             # Chat and Control Center static UI
+│   ├── admin.html
+│   ├── admin.css
+│   └── admin.js
 ├── app.py                              # API entry point (backward compatible)
 ├── main.py                             # CLI chat entry point (backward compatible)
 ├── .env                                # Environment variables
@@ -75,7 +88,7 @@ VMS_Help_Menu/
 - `answer_question()` - Main RAG pipeline with multi-route logic
 - `chat()` - CLI chat loop
 - `hybrid_search()` - Combines vector and BM25 results
-- Router logic: cache → small talk → direct context → retrieval
+- Router logic: live tool → cache → small talk → direct context → hybrid retrieval
 
 **`retrievers.py`**
 - `BM25Index` - Keyword-based search with BM25 scoring
@@ -88,6 +101,23 @@ VMS_Help_Menu/
 - `build_direct_context_prompt()` - For structured/direct requests
 - `format_history()` - Conversation history formatting
 - `classify_query()` - Routes query to appropriate handler
+
+**`tools.py`**
+- `get_current_time()` - Current time in the configured IANA timezone
+
+### `src/admin/`
+The additive AI Control Center service layer. It validates and atomically stores administrator-editable model, prompt, RAG, performance, and guardrail settings in `data/admin_config.json`. Secrets remain in `.env`.
+
+The admin UI is available at `http://localhost:5008/admin` and uses Bootstrap 5 with vanilla JavaScript. Its API endpoints are:
+
+```text
+GET  /admin/config
+PUT  /admin/config
+POST /admin/config/validate
+POST /admin/config/test
+GET  /admin/providers
+GET  /admin/health
+```
 
 ### `src/api/`
 **REST API layer**
@@ -116,7 +146,7 @@ VMS_Help_Menu/
 - `get_cached_answer()` - Exact and semantic cache lookup
 - `update_cache()` - Add/update cache entries
 - `make_cache_key()` - Key generation with SHA256 hashing
-- Semantic similarity matching with cosine distance (threshold: 0.90)
+- Semantic similarity matching with cosine distance (threshold: 0.82)
 
 **`datastore.py`**
 - `save_conversation()` - Background task for external API integration
@@ -213,25 +243,33 @@ Response:
 ### Environment Variables (`.env`)
 ```bash
 GROQ_API_KEY=your_groq_api_key_here
+CHAT_TIMEZONE=Asia/Kolkata
+# Admin login credentials; keep these values private and change them in production
+ADMIN_USERNAME=vmschat
+ADMIN_PASSWORD=vms123
+ADMIN_COOKIE_SECURE=false
+# Legacy alternative: ADMIN_TOKEN=replace-with-a-secret-token
 ```
 
 ### Application Configuration (`src/config.py`)
 **Embedding & LLM:**
 - `EMBEDDING_MODEL`: Ollama embedding model (default: `embeddinggemma:latest`)
-- `CHAT_MODEL`: LLM model (default: `llama-3.1-8b-instant`)
+- `CHAT_MODEL`: LLM model (default: `openai/gpt-oss-20b`)
 - `LLM_TEMPERATURE`: Creativity level (default: 0.3 for API, 0.7 for CLI)
-- `LLM_MAX_TOKENS`: Max response length (default: 160)
+- `LLM_MAX_TOKENS`: Max response length (default: 1024)
 
 **Retrieval Parameters:**
-- `VECTOR_TOP_K`: Vector search results (default: 2)
-- `BM25_TOP_K`: BM25 search results (default: 2)
-- `FINAL_TOP_K`: Final merged results (default: 3)
-- `MAX_CONTEXT_CHARS`: Context window size (default: 1800)
+- `VECTOR_TOP_K`: Vector search results (default: 4)
+- `BM25_TOP_K`: BM25 search results (default: 4)
+- `FINAL_TOP_K`: Final merged results (default: 6)
+- `MAX_CONTEXT_CHARS`: Retrieved context limit (default: 3500)
 
 **Cache & History:**
 - `MAX_HISTORY_MESSAGES`: Conversation history window (default: 6)
+- `MAX_HISTORY_CHARS`: Total prompt-history limit (default: 4000)
+- `MAX_HISTORY_MESSAGE_CHARS`: Per-message prompt-history limit (default: 1600)
 - `MAX_CACHE_ENTRIES`: Maximum cached responses (default: 200)
-- `SEMANTIC_CACHE_THRESHOLD`: Cache semantic match threshold (default: 0.90)
+- `SEMANTIC_CACHE_THRESHOLD`: Cache semantic match threshold (default: 0.82)
 
 **Data Paths:**
 - `PERSIST_DIRECTORY`: Chroma DB location (`data/chroma_db/`)
@@ -293,7 +331,7 @@ python main.py
 **Build and Run with Docker Compose:**
 ```bash
 # Build images and start all services
-docker compose up --build
+docker compose up -d --build
 
 # Services started:
 # - vapshelp-api: Main API on port 5008
@@ -308,7 +346,7 @@ docker compose up --build
 docker compose rm -f vapshelp-kb
 
 # Rebuild everything
-docker compose up --build
+docker compose up -d --build
 ```
 
 **Access API:**
@@ -326,11 +364,12 @@ curl -X POST http://localhost:5008/webhook/chat \
 
 ### Query Processing - Pure RAG Pipeline
 1. **Input**: User message via API or CLI
-2. **Classification**: Route query into one of three paths:
+2. **Classification**: Route query into one of five paths:
+   - **Live tool** (current-time request): Invoke the deterministic time tool without retrieval or caching
    - **Small Talk** (greeting): Return friendly response immediately
    - **Direct Context** (user provides content): Process with LLM only (no retrieval)
    - **Standard Query** (information request): Full RAG pipeline
-3. **Cache Check**: Look for exact or semantic match in cache
+3. **Cache Check**: Look for exact or semantic match in cache for non-tool requests
 4. **Retrieval** (if needed): Perform hybrid search (vector + BM25)
 5. **Context Building**: Prepare context window from retrieved documents
 6. **LLM Processing**: Generate response using Groq LLM
@@ -347,11 +386,17 @@ curl -X POST http://localhost:5008/webhook/chat \
 
 ### Cache System
 - **Exact Match**: Direct lookup by normalized question hash
-- **Semantic Match**: Cosine similarity with threshold of 0.90
+- **Semantic Match**: Cosine similarity with threshold of 0.82
 - **Persistence**: JSON file in `data/cache/chat_cache.json`
 - **Size Limit**: Max 200 entries, oldest entries removed when exceeded
 - **Embeddings**: Questions stored with their embeddings for semantic lookup
 - **Low-Confidence Bypass**: Cached answers with low confidence bypass retrieval
+
+## AI Control Center
+
+Open `http://localhost:5008/admin` after starting the API. The Control Center provides validated model, prompt, RAG, performance, and guardrail configuration, plus real system health checks and a non-persistent configuration test. It is intentionally not an analytics, lead-capture, or general chatbot interface.
+
+Admin login sessions expire 5 minutes after login. Set `ADMIN_COOKIE_SECURE=true` when serving the application over HTTPS.
 
 ## Requirements
 

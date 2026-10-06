@@ -11,7 +11,7 @@ Welcome to the **VMS_Help_Menu** (VAPSAI) repository. This document serves as th
 ### Non-Negotiable Invariants
 - **Pure RAG Focus**: This system is dedicated exclusively to accurate, grounded question-answering. Do **NOT** add lead collection forms, contact collection funnels, sales qualification gates, or marketing prompts.
 - **Strict Grounding**: The LLM must answer questions using retrieved context from the knowledge base. If context is missing or irrelevant, it must gracefully inform the user rather than hallucinating.
-- **Centralized Configuration**: All thresholds, model identifiers, API keys, paths, and limits **must** reside in `src/config.py`. Never hardcode magic numbers or environment variables in submodules.
+- **Centralized Configuration**: Default thresholds, model identifiers, paths, and limits reside in `src/config.py`; administrator-editable runtime values are validated and atomically persisted by `src/admin/config_service.py`. Secrets remain in `.env` and are never persisted in admin configuration.
 
 ---
 
@@ -28,7 +28,8 @@ VMS_Help_Menu/
 │   │   ├── __init__.py
 │   │   ├── rag.py                      # Main pipeline (answer_question, hybrid_search, chat)
 │   │   ├── retrievers.py               # BM25Index, VectorRetriever, BM25Retriever
-│   │   └── prompts.py                  # Prompt templates, formatting, query classification
+│   │   ├── prompts.py                  # Prompt templates, formatting, query classification
+│   │   └── tools.py                    # Deterministic live-information tools (for example, current time)
 │   ├── api/                            # REST API service layer
 │   │   ├── __init__.py
 │   │   ├── app.py                      # FastAPI app initialization, middleware, routes
@@ -73,6 +74,7 @@ VMS_Help_Menu/
 | **Vector Store** | ChromaDB (`langchain-chroma`) | Persisted in `data/chroma_db/` |
 | **Keyword Search** | Custom BM25 (`rank-bm25` / in-memory) | Persisted in `data/cache/bm25_index.pkl` |
 | **Document Processing** | PyMuPDF (`fitz`), LangChain Splitters | RecursiveCharacterTextSplitter |
+| **Live Tools** | LangChain tools + Python standard library | Current-time tool using configured IANA timezone |
 | **Datastore Logging** | Requests / FastAPI BackgroundTasks | Non-blocking async webhook to VMS staging |
 
 ---
@@ -87,6 +89,9 @@ VMS_Help_Menu/
 ### Environment Variables (`.env`)
 ```bash
 GROQ_API_KEY=gsk_your_groq_api_key_here
+
+# Optional timezone for live time requests; defaults to Asia/Kolkata
+CHAT_TIMEZONE=Asia/Kolkata
 ```
 
 ### Virtual Environment Activation (Windows)
@@ -191,18 +196,25 @@ log_error("Failed to query datastore", exc=err)
 
 ---
 
-## 7. RAG Pipeline Logic & Routing Invariants
+## 7. RAG Pipeline Logic, Tools & Routing Invariants
 
-When working with `src/core/rag.py` or modifying prompts in `src/core/prompts.py`, adhere to the four-tier routing hierarchy:
+When working with `src/core/rag.py` or modifying prompts in `src/core/prompts.py`, adhere to this routing hierarchy:
 
-1. **Exact & Semantic Cache**: Check `src.storage.cache` first. If an exact match or semantic match above `SEMANTIC_CACHE_THRESHOLD` exists, return immediately.
-2. **Small Talk / Greeting Route**: If `classify_query()` detects a greeting or non-technical pleasantry, respond with standard greeting instructions without querying vector or BM25 stores.
-3. **Direct Content Route**: If query includes instructions with explicit embedded content (`DIRECT_CONTENT_HINTS`), use direct context prompt generation.
-4. **Hybrid Retrieval (Vector + BM25)**:
+1. **Live Tool Route**: If `classify_query()` detects a current-time request, invoke `src.core.tools.get_current_time`. Do not use the response cache because time responses must remain current.
+2. **Exact & Semantic Cache**: Check `src.storage.cache` for non-tool requests. If an exact match or semantic match above `SEMANTIC_CACHE_THRESHOLD` exists, return immediately.
+3. **Small Talk / Greeting Route**: If `classify_query()` detects a greeting or non-technical pleasantry, respond with standard greeting instructions without querying vector or BM25 stores.
+4. **Direct Content Route**: If query includes instructions with explicit embedded content (`DIRECT_CONTENT_HINTS`), use direct context prompt generation.
+5. **Hybrid Retrieval (Vector + BM25)**:
    - Vector retriever fetches `VECTOR_TOP_K` semantic chunks.
    - BM25 retriever fetches `BM25_TOP_K` lexical matches.
    - Results are deduplicated and merged up to `FINAL_TOP_K`.
    - Prompt is generated and streamed/executed via Groq LLM.
+
+Prompt history must remain bounded. `to_langchain_messages()` and `format_history()` keep the newest `MAX_HISTORY_MESSAGES`, cap total history at `MAX_HISTORY_CHARS`, and cap each message at `MAX_HISTORY_MESSAGE_CHARS`. Do not add unbounded conversation history to prompts.
+
+The additive AI Control Center is served at `/admin` and uses `/admin/config`, `/admin/config/validate`, `/admin/config/test`, `/admin/providers`, and `/admin/health`. Its configuration flow is load → validate → atomically persist → apply. Never return or store API keys through this layer. It must preserve the public chat endpoints and pure-RAG behavior.
+
+Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` to protect the Control Center with HTTP Basic Auth. Successful login creates an HttpOnly signed session cookie that expires 5 minutes from login; expired cookies are rejected even if the browser retains Basic Auth credentials. Set `ADMIN_COOKIE_SECURE=true` for HTTPS. `ADMIN_TOKEN` remains supported as a legacy header-based alternative. Never hardcode credentials in Python, commit secrets, or expose them through the admin API.
 
 ---
 
@@ -214,3 +226,4 @@ When implementing changes or debugging issues in this repository:
 3. **Check configuration in `src/config.py`** before introducing new parameters or environment keys.
 4. **Preserve docstrings and comments** in existing modules unless refactoring specifically demands an update.
 5. **Verify file existence and directory paths** before file I/O operations (use `.mkdir(parents=True, exist_ok=True)`).
+6. **Keep live tools deterministic and narrowly scoped**. Tool results must not replace knowledge-base retrieval for VMS technical questions.

@@ -8,13 +8,18 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_groq import ChatGroq
 
+load_dotenv()
+
 from src.api.schemas import ChatRequest, ChatResponse
+from src.api.admin import require_admin_access, router as admin_router
+from src.admin.config_service import load_config
+from src.admin.config_service import default_config
 from src.config import (
     API_HOST,
     API_PORT,
@@ -32,9 +37,6 @@ from src.storage.cache import load_cache
 from src.storage.datastore import save_conversation
 from src.storage.vector_db import load_vector_store
 from src.utils.logging import log_error, log_step
-
-load_dotenv()
-
 
 class BoundedSessionStore:
     """Thread-safe bounded in-memory session history store with LRU eviction."""
@@ -69,6 +71,15 @@ class BoundedSessionStore:
 session_store = BoundedSessionStore()
 
 
+def _runtime_config():
+    """Load admin settings while retaining startup safety if the file is invalid."""
+    try:
+        return load_config()
+    except ValueError as exc:
+        log_error("ADMIN_CONFIG_LOAD_FAILED", exc)
+        return default_config()
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
     """Manage application startup and shutdown lifecycle."""
@@ -76,23 +87,30 @@ async def lifespan(app_instance: FastAPI):
     app_instance.state.vector_db = load_vector_store()
     app_instance.state.bm25_index = load_bm25_index(app_instance.state.vector_db)
     from src.core.retrievers import create_ensemble_retriever
+    runtime_config = _runtime_config()
     app_instance.state.ensemble_retriever = create_ensemble_retriever(
-        app_instance.state.vector_db, app_instance.state.bm25_index
+        app_instance.state.vector_db,
+        app_instance.state.bm25_index,
+        vector_top_k=runtime_config.rag.vector_top_k,
+        bm25_top_k=runtime_config.rag.bm25_top_k,
+        final_top_k=runtime_config.rag.final_top_k,
     )
     app_instance.state.llm = ChatGroq(
         groq_api_key=os.getenv("GROQ_API_KEY"),
-        model_name=CHAT_MODEL,
-        temperature=LLM_TEMPERATURE,
-        max_tokens=LLM_MAX_TOKENS,
+        model=runtime_config.models.primary_model,
+        temperature=runtime_config.models.temperature,
+        max_tokens=runtime_config.models.max_tokens,
+        timeout=runtime_config.models.request_timeout,
     )
     app_instance.state.cache = load_cache()
-    log_step("SERVER_READY", model=CHAT_MODEL)
+    log_step("SERVER_READY", model=runtime_config.models.primary_model)
     yield
     log_step("SERVER_STOPPED")
 
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(title=API_TITLE, lifespan=lifespan)
+app.include_router(admin_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -112,6 +130,7 @@ if _STATIC_DIR.is_dir():
 def _get_resources():
     """Ensure runtime resources are initialized even if lifespan wasn't triggered."""
     from src.core.retrievers import create_ensemble_retriever
+    runtime_config = _runtime_config()
 
     if not hasattr(app.state, "vector_db") or app.state.vector_db is None:
         app.state.vector_db = load_vector_store()
@@ -119,14 +138,19 @@ def _get_resources():
         app.state.bm25_index = load_bm25_index(app.state.vector_db)
     if not hasattr(app.state, "ensemble_retriever") or app.state.ensemble_retriever is None:
         app.state.ensemble_retriever = create_ensemble_retriever(
-            app.state.vector_db, app.state.bm25_index
+            app.state.vector_db,
+            app.state.bm25_index,
+            vector_top_k=runtime_config.rag.vector_top_k,
+            bm25_top_k=runtime_config.rag.bm25_top_k,
+            final_top_k=runtime_config.rag.final_top_k,
         )
     if not hasattr(app.state, "llm") or app.state.llm is None:
         app.state.llm = ChatGroq(
             groq_api_key=os.getenv("GROQ_API_KEY"),
-            model_name=CHAT_MODEL,
-            temperature=LLM_TEMPERATURE,
-            max_tokens=LLM_MAX_TOKENS,
+            model=runtime_config.models.primary_model,
+            temperature=runtime_config.models.temperature,
+            max_tokens=runtime_config.models.max_tokens,
+            timeout=runtime_config.models.request_timeout,
         )
     if not hasattr(app.state, "cache") or app.state.cache is None:
         app.state.cache = load_cache()
@@ -149,6 +173,12 @@ def health() -> dict[str, str]:
 def chat_ui() -> FileResponse:
     """Serve the chat UI HTML page."""
     return FileResponse(str(_STATIC_DIR / "index.html"))
+
+
+@app.get("/admin", include_in_schema=False, dependencies=[Depends(require_admin_access)])
+def admin_ui() -> FileResponse:
+    """Serve the internal AI Control Center UI."""
+    return FileResponse(str(_STATIC_DIR / "admin.html"))
 
 
 @app.post("/webhook/chat", response_model=ChatResponse)

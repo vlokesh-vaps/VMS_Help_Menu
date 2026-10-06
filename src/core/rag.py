@@ -19,8 +19,10 @@ from src.config import (
     MAX_HISTORY_MESSAGES,
 )
 from src.core.prompts import (
-    DIRECT_CONTEXT_PROMPT,
-    QA_PROMPT,
+    active_guardrail_text,
+    active_response_text,
+    build_active_direct_prompt,
+    build_active_qa_prompt,
     classify_query,
     to_langchain_messages,
 )
@@ -32,6 +34,7 @@ from src.core.retrievers import (
     create_ensemble_retriever,
     load_bm25_index,
 )
+from src.core.tools import call_time_tool
 from src.storage.cache import get_cached_answer, update_cache
 from src.storage.vector_db import load_vector_store
 from src.utils.logging import log_error, log_step
@@ -94,7 +97,7 @@ def build_rag_chain(llm: ChatGroq):
             "question": lambda x: x["question"],
             "chat_history": lambda x: x.get("chat_history", []),
         })
-        | QA_PROMPT
+        | build_active_qa_prompt()
         | llm
         | StrOutputParser()
     )
@@ -115,7 +118,7 @@ def build_direct_chain(llm: ChatGroq):
             "question": lambda x: x["question"],
             "chat_history": lambda x: x.get("chat_history", []),
         })
-        | DIRECT_CONTEXT_PROMPT
+        | build_active_direct_prompt()
         | llm
         | StrOutputParser()
     )
@@ -179,8 +182,27 @@ def answer_question(
     route = classify_query(question)
     log_step("ROUTE_DECISION", route=route)
 
+    # Live tool results must not be served from the response cache.
+    if route == "tool_call":
+        tool_start = time.perf_counter()
+        answer = call_time_tool()
+        tool_latency_ms = int((time.perf_counter() - tool_start) * 1000)
+        log_step("TOOL_CALL", tool="get_current_time", latency=f"{tool_latency_ms}ms")
+        log_step("VECTOR_SEARCH", latency="0ms", hits=0, source="tool")
+        log_step("BM25_SEARCH", latency="0ms", hits=0, source="tool")
+        log_step("SEARCH_DONE", latency="0ms", hits=0, source="tool")
+        log_step("LLM_RESPONSE", latency="0ms", source="tool")
+        return answer
+
     # 1. Check cache first
-    cached_answer = get_cached_answer(cache, question)
+    cache_enabled = True
+    try:
+        from src.admin.config_service import load_config
+
+        cache_enabled = load_config().performance.cache_enabled
+    except (OSError, ValueError):
+        pass
+    cached_answer = get_cached_answer(cache, question) if cache_enabled else None
     if cached_answer and not (
         route == "retrieval" and _is_low_confidence_cached_answer(cached_answer)
     ):
@@ -198,8 +220,12 @@ def answer_question(
 
     # 2. Handle small talk
     if route == "small_talk":
-        answer = "Hello! How can I assist you today with the VMS IssueManager platform?"
-        update_cache(cache, question, answer, route)
+        answer = active_response_text(
+            "greeting_prompt",
+            "Hello! How can I assist you today with the VMS IssueManager platform?",
+        )
+        if cache_enabled:
+            update_cache(cache, question, answer, route)
         log_step("VECTOR_SEARCH", latency="0ms", hits=0, source="route")
         log_step("BM25_SEARCH", latency="0ms", hits=0, source="route")
         log_step("SEARCH_DONE", latency="0ms", hits=0, source="route")
@@ -224,7 +250,8 @@ def answer_question(
         log_step("BM25_SEARCH", latency="0ms", hits=0, source="bypass")
         log_step("SEARCH_DONE", latency="0ms", hits=0, source="bypass")
         log_step("LLM_RESPONSE", latency=f"{llm_latency_ms}ms", route=route)
-        update_cache(cache, question, answer, route)
+        if cache_enabled:
+            update_cache(cache, question, answer, route)
         return answer
 
     # 4. Perform hybrid retrieval using EnsembleRetriever
@@ -234,8 +261,13 @@ def answer_question(
     if not docs:
         log_step("SEARCH_EMPTY", route=route)
         return (
-            "I don't have information about that in the VMS knowledge base. "
-            "Please provide more details or rephrase your question."
+            active_guardrail_text(
+                active_response_text(
+                    "no_answer_prompt",
+                    "I don't have information about that in the VMS knowledge base. "
+                    "Please provide more details or rephrase your question.",
+                )
+            )
         )
 
     # 5. Generate answer using LCEL RAG chain
@@ -261,7 +293,8 @@ def answer_question(
     if _is_low_confidence_cached_answer(answer):
         log_step("CACHE_SKIP", route=route, reason="low_confidence_answer")
     else:
-        update_cache(cache, question, answer, route)
+        if cache_enabled:
+            update_cache(cache, question, answer, route)
 
     return answer
 

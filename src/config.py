@@ -14,6 +14,12 @@ CACHE_FILE = BASE_DIR / "data/cache/chat_cache.json"
 BM25_CACHE_FILE = BASE_DIR / "data/cache/bm25_index.pkl"
 LOG_DIR = BASE_DIR / "data/logs"
 LOG_FILE = LOG_DIR / "chat.log"
+ADMIN_CONFIG_FILE = BASE_DIR / "data/admin_config.json"
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_SESSION_TTL_SECONDS = 300
+ADMIN_COOKIE_SECURE = os.getenv("ADMIN_COOKIE_SECURE", "false").lower() == "true"
 
 # ============================================================================
 # Model and Embedding Configuration
@@ -37,6 +43,8 @@ MAX_CONTEXT_CHARS = 3500
 # ============================================================================
 
 MAX_HISTORY_MESSAGES = 6
+MAX_HISTORY_CHARS = 4000
+MAX_HISTORY_MESSAGE_CHARS = 1600
 MAX_SESSION_ENTRIES = 1000
 CACHE_VERSION = 2
 MAX_CACHE_ENTRIES = 200
@@ -48,6 +56,11 @@ SEMANTIC_CACHE_THRESHOLD = 0.82
 
 TOKEN_PATTERN = re.compile(r"\b\w+\b")
 GREETING_PATTERN = re.compile(r"^(hi|hello|hey|good morning|good afternoon|good evening)\b")
+TIME_QUERY_PATTERN = re.compile(
+    r"\b(what(?:'s| is)? the time|what time is it|current time|time now|tell me the time)\b"
+)
+CHAT_TIMEZONE = os.getenv("CHAT_TIMEZONE", "Asia/Kolkata")
+TIME_DISPLAY_FORMAT = "%A, %d %B %Y at %I:%M:%S %p"
 
 # ============================================================================
 # Prompt Hints

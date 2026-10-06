@@ -24,4 +24,5 @@ EXPOSE 5008
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5008/', timeout=3).read()"
 
-CMD ["uvicorn", "src.api.app:app", "--host", "0.0.0.0", "--port", "5008", "--workers", "4"]
+# Keep one process so in-memory sessions and runtime Control Center changes stay consistent.
+CMD ["uvicorn", "src.api.app:app", "--host", "0.0.0.0", "--port", "5008", "--workers", "1"]
